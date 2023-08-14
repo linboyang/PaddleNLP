@@ -972,7 +972,7 @@ class GPTForGenerationAuto(nn.Layer):
             model_inputs = self.prepare_inputs_for_generation(input_ids, **args, **immutable)
             return self.gpt(**model_inputs, **immutable)
 
-        def _post_process_(outputs, input_ids, cur_len, origin_len, scores, unfinished_flag, model_kwargs):
+        def _post_process_(outputs, input_ids, cur_len, origin_len, unfinished_flag, model_kwargs):
 
             logits = outputs[0] if isinstance(outputs, tuple) else outputs
 
@@ -997,9 +997,17 @@ class GPTForGenerationAuto(nn.Layer):
                 origin_probs = paddle.log(origin_probs)
                 logits = logits / temperature
                 probs = F.softmax(logits)
-            if top_k is not None and top_k != 0:
+            get_next_tokens_by_custom_toppk = False    
+            if top_k is not None and top_k != 0 and top_p is not None and top_p < 1.0 and not self.use_topp_sampling:  
+                get_next_tokens_by_custom_toppk = True
+                useful_logits, useful_idxs = CustomTopKAndP(logits, top_k, top_p, min_tokens_to_keep)
+                probs = F.softmax(useful_logits, axis=-1)
+                probs = paddle.flip(probs, axis=[1])
+                next_token_useful_idxs = paddle.multinomial(probs)
+                next_tokens = paddle.index_sample(useful_idxs, next_token_useful_idxs)
+            elif top_k is not None and top_k != 0:
                 probs = TopKProcess(probs, top_k, min_tokens_to_keep)
-            if top_p is not None and top_p < 1.0:
+            elif top_p is not None and top_p < 1.0:
                 if self.use_topp_sampling:
                     try:
                         from ppfleetx_ops import topp_sampling
@@ -1014,7 +1022,7 @@ class GPTForGenerationAuto(nn.Layer):
                 else:
                     probs = TopPProcess(probs, top_p, min_tokens_to_keep)
 
-            if not self.use_topp_sampling:
+            if not get_next_tokens_by_custom_toppk and not self.use_topp_sampling:
                 next_tokens = paddle.multinomial(probs)
 
             next_scores = paddle.index_sample(origin_probs, next_tokens)
@@ -1033,14 +1041,14 @@ class GPTForGenerationAuto(nn.Layer):
                 next_tokens, outputs, model_kwargs, is_encoder_decoder=self.is_encoder_decoder
             )
 
-            return input_ids, scores, unfinished_flag, model_kwargs
+            return input_ids, unfinished_flag, model_kwargs
 
         # Note(GuoxiaWang):Pre-while call for inference, simulate a do while loop statement
         # the value in model_kwargs should be tensor before while loop
         outputs = _forward_(**model_kwargs)
 
-        input_ids, scores, unfinished_flag, model_kwargs = _post_process_(
-            outputs, input_ids, cur_len_gpu, origin_len_gpu, scores, unfinished_flag, model_kwargs
+        input_ids, unfinished_flag, model_kwargs = _post_process_(
+            outputs, input_ids, cur_len_gpu, origin_len_gpu, unfinished_flag, model_kwargs
         )
         if not self.inference:
             cur_len += 1
@@ -1058,12 +1066,11 @@ class GPTForGenerationAuto(nn.Layer):
             # Note(GuoxiaWang): Remove outputs = _forward_(**model_kwargs)
             # and change it to pass directly to _post_process_ to avoid
             # closed-loop problem of dynamic-to-static model
-            input_ids, scores, unfinished_flag, model_kwargs = _post_process_(
+            input_ids, unfinished_flag, model_kwargs = _post_process_(
                 _forward_(**model_kwargs),
                 input_ids,
                 cur_len_gpu,
                 origin_len_gpu,
-                scores,
                 unfinished_flag,
                 model_kwargs,
             )
@@ -1215,3 +1222,18 @@ class GPTForGenerationAuto(nn.Layer):
         else:
             raise ValueError(f"Not support {decode_strategy} strategy yet!")
         return ret
+
+def CustomTopKAndP(scores, top_k, top_p, min_tokens_to_keep):
+    top_k = max(top_k, min_tokens_to_keep)
+    top_k = min(top_k, scores.shape[-1])
+    values, indices =  paddle.topk(scores, top_k)
+    values = paddle.flip(values, axis=[1])
+    cumulative_probs = paddle.cumsum(F.softmax(x=values, axis=-1), axis=-1)
+    sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
+    if min_tokens_to_keep > 1:
+        # Keep at least min_tokens_to_keep
+        sorted_indices_to_remove[..., -min_tokens_to_keep :] = 0
+
+    values = paddle.where(sorted_indices_to_remove, paddle.full_like(values, -65500), values)
+
+    return values, indices
