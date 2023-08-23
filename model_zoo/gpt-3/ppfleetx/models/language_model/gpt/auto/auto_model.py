@@ -770,12 +770,6 @@ class GPTForGenerationAuto(nn.Layer):
             attention_mask = paddle.zeros_like(input_ids, dtype=paddle.get_default_dtype())
         return paddle.unsqueeze(attention_mask, axis=[1, 2])
 
-    def update_scores_for_generation(self, scores, next_scores, length, unfinished_flag):
-        # update scores
-
-        unfinished_scores = (scores * length + next_scores) / (length + 1)
-        scores = paddle.where(unfinished_flag, unfinished_scores, scores)
-        return scores
 
     def get_logits_processor(
         self,
@@ -958,7 +952,6 @@ class GPTForGenerationAuto(nn.Layer):
         origin_len_gpu = paddle.full([1], origin_len, dtype="int64")
 
         unfinished_flag = paddle.full([batch_size, 1], True, dtype="bool")
-        scores = paddle.full([batch_size, 1], 0.0, dtype=paddle.get_default_dtype())
 
         res = paddle.assign(input_ids)
         model_kwargs["res"] = res
@@ -1025,12 +1018,8 @@ class GPTForGenerationAuto(nn.Layer):
             if not get_next_tokens_by_custom_toppk and not self.use_topp_sampling:
                 next_tokens = paddle.multinomial(probs)
 
-            next_scores = paddle.index_sample(origin_probs, next_tokens)
-
             if eos_token_id is not None:
                 next_tokens = paddle.where(unfinished_flag, next_tokens, paddle.full_like(next_tokens, pad_token_id))
-
-            scores = self.update_scores_for_generation(scores, next_scores, cur_len - origin_len, unfinished_flag)
 
             input_ids = next_tokens
 
@@ -1086,7 +1075,7 @@ class GPTForGenerationAuto(nn.Layer):
             if self.early_finish and not paddle.any(unfinished_flag):
                 break
 
-        return model_kwargs["res"][:, origin_len:], scores
+        return model_kwargs["res"][:, origin_len:]
 
     def forward(self, input_ids=None, **model_kwargs):
 
